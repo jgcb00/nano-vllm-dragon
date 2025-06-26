@@ -40,16 +40,20 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        """Add a request to the scheduler."""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
     def step(self):
+        # Get the next batch of sequences to run
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
+        ]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
@@ -64,30 +68,50 @@ class LLMEngine:
     ) -> list[str]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+
+        # If given only one sampling_params, replicate it for each prompt
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+
+        # Add each request to the scheduler
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+
         outputs = {}
-        prefill_throughput = decode_throughput = 0.
+        prefill_throughput = decode_throughput = 0.0
+        total_prefill_tokens = total_decode_tokens = 0
         while not self.is_finished():
             t = perf_counter()
+
+            # Run a step of the model
             output, num_tokens = self.step()
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
+                    total_prefill_tokens += num_tokens
                 else:
                     decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
+                    total_decode_tokens += -num_tokens
+                pbar.set_postfix(
+                    {
+                        "Prefill": f"{int(prefill_throughput)}tok/s",
+                        "Decode": f"{int(decode_throughput)}tok/s",
+                    }
+                )
+            # Collect outputs from the step
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [
+            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
+            for token_ids in outputs
+        ]
         if use_tqdm:
             pbar.close()
+        print(
+            f"Prefill throughput: {prefill_throughput:.2f} tok/s, tokens : {total_prefill_tokens}, "
+            f"Decode throughput: {decode_throughput:.2f} tok/s, tokens : {total_decode_tokens}"
+        )
         return outputs

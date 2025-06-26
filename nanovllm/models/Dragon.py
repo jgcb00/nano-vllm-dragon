@@ -1,12 +1,14 @@
+import math
 import torch
 from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
 
-from nanovllm.layers.activation import SiluAndMul
+from nanovllm.layers.activation import Srelu
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
@@ -90,7 +92,7 @@ class Qwen3Attention(nn.Module):
         return output
 
 
-class Qwen3MLP(nn.Module):
+class DragonMLP(nn.Module):
 
     def __init__(
         self,
@@ -99,9 +101,9 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.up_proj = ColumnParallelLinear(
             hidden_size,
-            [intermediate_size] * 2,
+            intermediate_size,
             bias=False,
         )
         self.down_proj = RowParallelLinear(
@@ -109,24 +111,36 @@ class Qwen3MLP(nn.Module):
             hidden_size,
             bias=False,
         )
-        assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
+        assert (
+            hidden_act == "srelu"
+        ), "Dragon models were trained with squared ReLU (SReLU) activation."
+        self.act_fn = Srelu()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = self.p_proj(x)
+        x = self.act_fn(x)
         x = self.down_proj(x)
         return x
 
 
-class Qwen3DecoderLayer(nn.Module):
+class DragonDecoderLayer(nn.Module):
 
     def __init__(
         self,
         config: Qwen3Config,
+        swa: bool = False,
+        layer_depth: int = 0,
+        kv_source=None,
     ) -> None:
+        """
+        swa: whether to use local attention/SWA for this block, or global
+        kv_source: layer to get KV from, if any
+        """
         super().__init__()
-        self.self_attn = Qwen3Attention(
+
+        self.premixer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -137,15 +151,29 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.mlp = Qwen3MLP(
+
+        self.lin_attn = None
+
+        self.lin_attn_group_norm = None
+        self.attn_group_norm = None
+
+        self.out_proj = RowParallelLinear()
+
+        self.premlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.mlp = DragonMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+
+        self.register_buffer(
+            "layer_norm_scaling", torch.tensor(1 / math.sqrt(layer_depth + 1))
         )
+
+        # Caution, this can cause differences in the output because of different rounding errors
+        self.premlp_norm.weight.data.mul_(self.layer_norm_scaling)
+        self.premixer_norm.weight.data.mul_(self.layer_norm_scaling)
 
     def forward(
         self,
@@ -153,18 +181,28 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        # if residual is None:
+        #     residual = hidden_states
+        #     hidden_states = self.input_layernorm(hidden_states)
+        # else:
+        #     hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.premixer_norm(hidden_states)
+
+        y_attn = self.attn(positions, hidden_states)
+        y_lin_attn = self.lin_attn(positions, hidden_states)
+
+        y_attn = self.attn_group_norm(y_attn).view(y_attn.size(0), y_attn.size(1), -1)
+        y_lin_attn = self.lin_attn_group_norm(y_lin_attn).view(
+            y_lin_attn.size(0), y_lin_attn.size(1), -1
+        )
+
+        x = x + self.out_proj((y_attn + y_lin_attn) / 2)
+
+        hidden_states = self.mlp(self.premlp_norm(hidden_states))
+        return hidden_states
 
 
-class Qwen3Model(nn.Module):
+class DragonModel(nn.Module):
 
     def __init__(
         self,
@@ -175,9 +213,10 @@ class Qwen3Model(nn.Module):
             config.vocab_size, config.hidden_size
         )
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [DragonDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = ParallelLMHead()
 
     def forward(
         self,
@@ -192,7 +231,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class DragonForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -203,7 +242,7 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.model = DragonModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
