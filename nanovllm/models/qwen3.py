@@ -40,7 +40,6 @@ class Qwen3Attention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -65,7 +64,6 @@ class Qwen3Attention(nn.Module):
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
-            self.scaling,
             self.num_kv_heads,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)

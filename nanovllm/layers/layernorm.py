@@ -49,3 +49,15 @@ class RMSNorm(nn.Module):
             return self.rms_forward(x)
         else:
             return self.add_rms_forward(x, residual)
+
+class HeadWiseRMSNorm(torch.nn.Module):
+    def __init__(self, n_heads, d_head, eps=1e-5):
+        super().__init__()
+        #Benchmark the two implementation of the RMS norm
+        self.rms = nn.RMSNorm(d_head, eps=eps, elementwise_affine=False)
+        self.weight = nn.Parameter(torch.ones(n_heads, d_head))
+
+    def forward(self, x):
+        B, L, H, D = x.shape
+        y = self.rms(x) * self.weight.view(1, 1, H, D)
+        return y.view(B, L, H, D)

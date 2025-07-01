@@ -53,8 +53,8 @@ class Attention(nn.Module):
         self,
         num_heads,
         head_dim,
-        scale,
         num_kv_heads,
+        scale=None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -95,11 +95,14 @@ class Attention(nn.Module):
                 v_cache,
                 cache_seqlens=context.context_lens,
                 #block_table=context.block_tables,
-                page_table=context.block_tables,                softmax_scale=self.scale,
+                page_table=context.block_tables,
+                softmax_scale=self.scale,
                 causal=True,
             )
             #print("flash_attn_with_kvcache")
-        #print(len(o))
+        print(k_cache.shape)
+        print(v_cache.shape)
+        print(context.slot_mapping)
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
 

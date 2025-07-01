@@ -92,10 +92,12 @@ class LLMEngine:
                 else:
                     decode_throughput = -num_tokens / (perf_counter() - t)
                     total_decode_tokens += -num_tokens
+                    user_throughput = 1 / (perf_counter() - t)
                 pbar.set_postfix(
                     {
                         "Prefill": f"{int(prefill_throughput)}tok/s",
                         "Decode": f"{int(decode_throughput)}tok/s",
+                        "User" : f"{user_throughput:.2f}tok/s"
                     }
                 )
             # Collect outputs from the step
@@ -113,5 +115,6 @@ class LLMEngine:
         print(
             f"Prefill throughput: {prefill_throughput:.2f} tok/s, tokens : {total_prefill_tokens}, "
             f"Decode throughput: {decode_throughput:.2f} tok/s, tokens : {total_decode_tokens}"
+            f"USer throughput: {user_throughput:.2f} tok/s"
         )
         return outputs

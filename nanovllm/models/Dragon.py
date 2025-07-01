@@ -6,7 +6,7 @@ from transformers import Qwen3Config
 
 from nanovllm.layers.activation import Srelu
 from nanovllm.layers.attention import Attention
-from nanovllm.layers.layernorm import RMSNorm
+from nanovllm.layers.layernorm import RMSNorm, HeadWiseRMSNorm
 from nanovllm.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -30,6 +30,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        swa: bool = False,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -64,12 +65,39 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_kv_heads,
-        )
+        if swa :
+            self.attn = SwaAttention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+            )
+        else:
+            self.register_buffer(
+                "lambda_init", torch.tensor(0.8 - 0.6 * math.exp(-0.3 * layer_depth))
+            )
+            self.lambda_q1 = torch.nn.Parameter(
+                torch.zeros((head_dim,), dtype=torch.float32).normal_(mean=0, std=0.1)
+            )
+            self.lambda_k1 = torch.nn.Parameter(
+                torch.zeros((head_dim,), dtype=torch.float32).normal_(mean=0, std=0.1)
+            )
+            self.lambda_q2 = torch.nn.Parameter(
+                torch.zeros((head_dim,), dtype=torch.float32).normal_(mean=0, std=0.1)
+            )
+            self.lambda_k2 = torch.nn.Parameter(
+                torch.zeros((head_dim,), dtype=torch.float32).normal_(mean=0, std=0.1)
+            )
+            self.softmax_scaler = nn.Parameter(
+                torch.ones(self.n_heads, dtype=torch.float32)
+            )
+            self.attn = DiffAttention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+            )
+
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -91,6 +119,9 @@ class Qwen3Attention(nn.Module):
         output = self.o_proj(o)
         return output
 
+
+class DragonGatedDeltaNet(nn.Module):
+    pass
 
 class DragonMLP(nn.Module):
 
@@ -152,10 +183,28 @@ class DragonDecoderLayer(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
         )
 
-        self.lin_attn = None
+        if swa:
+            self.attn_group_norm = HeadWiseRMSNorm(
+                n_heads=config.num_attention_heads,
+                d_head=2 * config.hidden_size // config.num_attention_heads,
+                eps=config.rms_norm_eps,
+            )
+        else :
+            self.attn_group_norm = HeadWiseRMSNorm(
+                n_heads=config.num_attention_heads // 2,
+                d_head=4 * config.hidden_size // config.num_attention_heads,
+                eps=config.rms_norm_eps,
+            )
 
-        self.lin_attn_group_norm = None
-        self.attn_group_norm = None
+        
+
+        self.lin_attn = DragonGatedDeltaNet
+
+        self.lin_attn_group_norm = HeadWiseRMSNorm(
+            n_heads=config.n_heads, 
+            d_head=2 * config.hidden_size // config.num_attention_heads,
+            eps=config.eps_rmsnorm
+        )
 
         self.out_proj = RowParallelLinear()
 
