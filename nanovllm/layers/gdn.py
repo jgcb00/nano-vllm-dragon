@@ -185,7 +185,7 @@ class MixerGatedDeltaNet(nn.Module):
         beta = b_proj.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a_proj.float() + self.dt_bias)
 
-        if mode == "chunk":
+        if context.is_prefill:
             o, h_cache = chunk_gated_delta_rule(
                 q=q.bfloat16(),
                 k=k.bfloat16(),
@@ -198,7 +198,7 @@ class MixerGatedDeltaNet(nn.Module):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )  # (b t h d) where d is head_v_dim
-        elif mode == "fused_recurrent":
+        else :
             o, h_cache = fused_recurrent_gated_delta_rule(
                 q=q.bfloat16(),
                 k=k.bfloat16(),
@@ -211,8 +211,6 @@ class MixerGatedDeltaNet(nn.Module):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )  # (b t h d) where d is head_v_dim
-        else:
-            raise NotImplementedError(f"Not supported mode `{mode}`.")
 
         # gate
         g = self.g_proj(hidden_states).view(
