@@ -153,6 +153,66 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.size() == loaded_weight.size()
         param_data.copy_(loaded_weight)
 
+class QKVDAGParallelLinear(ColumnParallelLinear):
+    """A linear layer that loads correct weights for
+    query, key, value, dt_bias, A_log, and Gate for GDN layers
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        bias: bool = False,
+    ):
+        self.head_size = head_size
+        self.v_head_size = head_size * 2  # For GDN, value has double the head size
+        self.total_num_heads = total_num_heads
+        tp_size = dist.get_world_size()
+        self.num_heads = divide(self.total_num_heads, tp_size)
+        input_size = hidden_size
+        output_size = (
+            6 * self.head_size # Q, K , V (2), G (2)
+            +  2 #dt_bias, A
+        ) *self.total_num_heads
+        assert bias == False
+        self.qkv_slice = 4 * self.num_heads * head_size
+        self.gate_slice = 2 * self.num_heads * head_size
+        super().__init__(input_size, output_size, bias)
+
+    def weight_loader(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
+    ):
+        param_data = param.data
+        print(loaded_shard_id)
+        assert loaded_shard_id in ["q", "k", "v", "g_proj", "a_proj", "b_proj"]
+        if loaded_shard_id == "q":
+            shard_size = self.num_heads * self.head_size
+            shard_offset = 0
+        elif loaded_shard_id == "k":
+            shard_size = self.num_heads * self.head_size
+            shard_offset = self.num_heads * self.head_size
+        elif loaded_shard_id == "v":
+            shard_size = self.v_head_size
+            shard_offset = 2 * self.num_heads * self.head_size
+        elif loaded_shard_id == "g_proj":
+            shard_size = self.num_heads * self.head_size
+            shard_offset = 4 * self.num_heads * self.head_size
+        elif loaded_shard_id == "a_proj":
+            shard_size = self.num_heads
+            shard_offset = 6 * self.num_heads * self.head_size
+        elif loaded_shard_id == "b_proj":
+            shard_size = self.num_heads
+            shard_offset =  6 * self.num_heads * self.head_size + self.num_heads
+        else:
+            raise ValueError(f"Wrong shard id : {loaded_shard_id}")
+        param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        assert param_data.size() == loaded_weight.size()
+        param_data.copy_(loaded_weight)
+
+    def forward(self, x):
+        y = super().forward(x)
+        return y.split([self.qkv_slice, self.gate_slice, self.num_heads, self.num_heads], dim=-1)
 
 class RowParallelLinear(LinearBase):
 
